@@ -12,9 +12,12 @@ package zbytes
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"sync"
+	"time"
 
+	statsd "github.com/smira/go-statsd"
 	"github.com/valyala/gozstd"
 )
 
@@ -26,6 +29,8 @@ import (
 type Wrapper interface {
 	Unwrap(*Wrapped) []byte
 	Wrap([]byte) *Wrapped
+	PeriodicStatsCollector(prefix string, stats *statsd.Client, period time.Duration, tags ...statsd.Tag)
+	GetStats() Stats
 }
 
 type Wrapped struct {
@@ -38,19 +43,60 @@ func (w *Wrapped) IsCompressed() bool {
 	return w.isCompressed
 }
 
-type stats struct {
-	messages         int64
-	uncompressedSize int64
-	compressedSize   int64
-	mutex            *sync.Mutex
+type Stats struct {
+	UncompressedMessages int64
+	CompressedMessages   int64
+	UncompressedBytes    int64 // total size of messages prior to compression
+	CompressedBytes      int64 // total size of messages after compression (or if not compressed, the original size)
+	mutex                *sync.Mutex
 }
 
 type wrapper struct {
 	cdict             *gozstd.CDict
 	ddict             *gozstd.DDict
 	dictionaryBuilder chan<- []byte
-	Stats             stats
-	// mutex             *sync.RWMutex
+	compressionLevel  int
+	Stats             Stats
+}
+
+func (w *wrapper) GetStats() Stats {
+	return w.Stats
+}
+
+// At the specified period, generate a number of Gauge statistics
+// relating to the volume of messages and level of compression.
+func (w *wrapper) PeriodicStatsCollector(prefix string, stats *statsd.Client, period time.Duration, tags ...statsd.Tag) {
+	if stats == nil {
+		return
+	}
+	ticker := time.NewTicker(period)
+	for {
+		<-ticker.C
+		w.Stats.CollectStats(prefix, stats, tags...)
+	}
+}
+
+// Generate a number of Gauge statistics relating to the
+// volume of messages and level of compression since the last call.
+func (s *Stats) CollectStats(prefix string, stats *statsd.Client, tags ...statsd.Tag) {
+	if stats == nil {
+		return
+	}
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	stats.Gauge(fmt.Sprintf("%vuncompressed-messages", prefix), s.UncompressedMessages, tags...)
+	stats.Gauge(fmt.Sprintf("%vcompressed-messages", prefix), s.CompressedMessages, tags...)
+	stats.Gauge(fmt.Sprintf("%vuncompressed-bytes", prefix), s.UncompressedBytes, tags...)
+	stats.Gauge(fmt.Sprintf("%vcompressed-bytes", prefix), s.CompressedBytes, tags...)
+	if s.CompressedBytes > 0 {
+		// ratio of 10 implies the uncompressed size is 10 times the compressed size
+		// on average, during this sampling period
+		stats.FGauge(fmt.Sprintf("%vcompression-ratio", prefix), float64(s.UncompressedBytes)/float64(s.CompressedBytes), tags...)
+	}
+	s.UncompressedMessages = 0
+	s.CompressedMessages = 0
+	s.UncompressedBytes = 0
+	s.CompressedBytes = 0
 }
 
 func (w *wrapper) buildDictionary(db chan []byte, dictionarySize int, minimumSize int) {
@@ -82,9 +128,9 @@ func (w *wrapper) buildDictionary(db chan []byte, dictionarySize int, minimumSiz
 // will be constructed from the first sourceDataSize bytes of input;
 // prior to this, data will be stored internally, uncompressed.
 // The dictionary's size when built will be dictionarySize bytes.
-func CreateWrapper(dictionarySize int, sourceDataSize int) Wrapper {
+func CreateWrapper(dictionarySize int, sourceDataSize int, compressionLevel int) *wrapper {
 	dictionaryBuilder := make(chan []byte, 0)
-	wrapper := &wrapper{dictionaryBuilder: dictionaryBuilder, Stats: stats{mutex: new(sync.Mutex)}}
+	wrapper := &wrapper{dictionaryBuilder: dictionaryBuilder, compressionLevel: compressionLevel, Stats: Stats{mutex: new(sync.Mutex)}}
 	go wrapper.buildDictionary(dictionaryBuilder, dictionarySize, sourceDataSize)
 	return wrapper
 }
@@ -100,12 +146,17 @@ func (w *wrapper) Wrap(b []byte) *Wrapped {
 		default:
 			break
 		}
+		w.Stats.mutex.Lock()
+		defer w.Stats.mutex.Unlock()
+		w.Stats.UncompressedMessages += 1
+		w.Stats.UncompressedBytes += int64(len(b))
+		w.Stats.CompressedBytes += int64(len(b))
 		return &Wrapped{isCompressed: false, raw: b}
 	} else {
 		// don't try to reuse the writers for now
 		var bb bytes.Buffer
 
-		encoder := gozstd.NewWriterDict(&bb, w.cdict)
+		encoder := gozstd.NewWriterParams(&bb, &gozstd.WriterParams{CompressionLevel: w.compressionLevel, Dict: w.cdict})
 		defer encoder.Release()
 		if _, err := encoder.Write(b); err != nil {
 			log.Fatal(err)
@@ -115,7 +166,13 @@ func (w *wrapper) Wrap(b []byte) *Wrapped {
 		if err := encoder.Flush(); err != nil {
 			log.Fatalf("cannot flush compressed data: %s", err)
 		}
-		return &Wrapped{isCompressed: true, raw: bb.Bytes()}
+		compressed := bb.Bytes()
+		w.Stats.mutex.Lock()
+		defer w.Stats.mutex.Unlock()
+		w.Stats.CompressedMessages += 1
+		w.Stats.UncompressedBytes += int64(len(b))
+		w.Stats.CompressedBytes += int64(len(compressed))
+		return &Wrapped{isCompressed: true, raw: compressed}
 	}
 }
 

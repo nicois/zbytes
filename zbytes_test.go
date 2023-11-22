@@ -60,6 +60,20 @@ func TestE2e(t *testing.T) {
 			if 2*len(wrapped.raw) > len(b) {
 				t.Errorf("%v; compressed size: %v; uncompressed size: %v", message, len(wrapped.raw), len(b))
 			}
+
+			// Serialise the wrapper into a buffer, then ensure that
+			// a new wrapper compresses the data exactly the same.
+			var bb bytes.Buffer
+			wrapper.Backup(&bb)
+			t.Logf("Backed up the wrapper in %v bytes", bb.Len())
+			newWrapper, err := RestoreWrapper(&bb)
+			if err != nil {
+				t.Error(err)
+			}
+			newWrapped := newWrapper.Wrap(b)
+			if !bytes.Equal(wrapped.raw, newWrapped.raw) {
+				t.Errorf("Expected %v bytes, got %v", len(wrapped.raw), len(newWrapped.raw))
+			}
 			return
 		}
 	}

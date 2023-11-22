@@ -12,7 +12,9 @@ package zbytes
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -31,6 +33,8 @@ type Wrapper interface {
 	Wrap([]byte) *Wrapped
 	PeriodicStatsCollector(prefix string, stats *statsd.Client, period time.Duration, tags ...statsd.Tag)
 	GetStats() Stats
+	Backup(io.Writer) error
+	Release()
 }
 
 type Wrapped struct {
@@ -54,9 +58,74 @@ type Stats struct {
 type wrapper struct {
 	cdict             *gozstd.CDict
 	ddict             *gozstd.DDict
+	dictionary        []byte
 	dictionaryBuilder chan<- []byte
 	compressionLevel  int
 	Stats             Stats
+}
+
+// Release underlying allocated memory used by the
+// custom compression dictionary, ensuring it's available
+// for garbage-collection
+func (w *wrapper) Release() {
+	w.cdict.Release()
+	w.ddict.Release()
+	w.dictionary = nil
+}
+
+// Recreate a Wrapper from a backup.
+func RestoreWrapper(reader io.Reader) (*wrapper, error) {
+	b := make([]byte, 8)
+	_, err := reader.Read(b)
+	if err != nil {
+		return nil, err
+	}
+	compressionLevel := int(binary.LittleEndian.Uint64(b))
+	_, err = reader.Read(b)
+	if err != nil {
+		return nil, err
+	}
+	dictionarySize := binary.LittleEndian.Uint64(b)
+	dictionary := make([]byte, dictionarySize)
+	bytesRead, err := reader.Read(dictionary)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(bytesRead) != dictionarySize {
+		return nil, fmt.Errorf("Could not read in the complete dictionary of %v bytes; could only read %v bytes", dictionarySize, bytesRead)
+	}
+	result := wrapper{dictionary: dictionary, compressionLevel: compressionLevel, Stats: Stats{mutex: new(sync.Mutex)}}
+	if err = generateDictionaries(&result); err == nil {
+		return &result, nil
+	} else {
+		return nil, err
+	}
+}
+
+// Serialise the wrapper, suitable for persisting across application
+// restats. All required state is included.
+// Use RestoreWrapper() to reverse this.
+// This will fail if a compression dictionary has not yet been created.
+func (w *wrapper) Backup(writer io.Writer) error {
+	if w.ddict == nil || w.cdict == nil {
+		return fmt.Errorf("No dictionary has yet been created, so there is nothing worth backing up.")
+	}
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, uint64(w.compressionLevel))
+	_, err := writer.Write(b)
+	if err != nil {
+		return err
+	}
+	binary.LittleEndian.PutUint64(b, uint64(len(w.dictionary)))
+	_, err = writer.Write(b)
+	if err != nil {
+		return err
+	}
+	_, err = writer.Write(w.dictionary)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (w *wrapper) GetStats() Stats {
@@ -109,18 +178,25 @@ func (w *wrapper) buildDictionary(db chan []byte, dictionarySize int, minimumSiz
 			break
 		}
 	}
-	dictionary := gozstd.BuildDict(inputs, dictionarySize)
+	w.dictionary = gozstd.BuildDict(inputs, dictionarySize)
+	if err := generateDictionaries(w); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func generateDictionaries(w *wrapper) error {
 	// ensure decoder is in place before the encoder
-	if ddict, err := gozstd.NewDDict(dictionary); err == nil {
+	if ddict, err := gozstd.NewDDict(w.dictionary); err == nil {
 		w.ddict = ddict
 	} else {
-		log.Fatal(err)
+		return err
 	}
-	if cdict, err := gozstd.NewCDict(dictionary); err == nil {
+	if cdict, err := gozstd.NewCDict(w.dictionary); err == nil {
 		w.cdict = cdict
 	} else {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 // Creates a Wrapper, capable of wrapping byte arrays.
